@@ -1,9 +1,5 @@
 cd "text-to-image-fast-inference"
 
---
-
-Commit 2
-
 **Steps**
 1. Get your OpenRouter API key
 Go to https://openrouter.ai/keys → create a key → make sure you have credits (FLUX Schnell is ~$0.003/image)
