@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Text to Image — Fast Inference</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f0f0f;
+    color: #e8e8e8;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+    padding: 32px 16px;
+  }
+
+  h1 {
+    font-size: 1.4rem;
+    font-weight: 500;
+    color: #aaa;
+    letter-spacing: 0.02em;
+  }
+
+  .input-row {
+    display: flex;
+    gap: 10px;
+    width: 100%;
+    max-width: 600px;
+  }
+
+  input[type="text"] {
+    flex: 1;
+    padding: 12px 16px;
+    font-size: 1rem;
+    border: 1px solid #333;
+    border-radius: 10px;
+    background: #1a1a1a;
+    color: #eee;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  input[type="text"]:focus { border-color: #555; }
+  input[type="text"]::placeholder { color: #555; }
+
+  /* Canvas container */
+  .canvas-wrap {
+    position: relative;
+    width: 512px;
+    height: 512px;
+    max-width: 90vw;
+    max-height: 90vw;
+    border-radius: 14px;
+    overflow: hidden;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+  }
+
+  canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  /* Loading overlay */
+  .loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 15, 15, 0.85);
+    opacity: 0;
+    transition: opacity 0.15s;
+    pointer-events: none;
+  }
+  .loading-overlay.visible { opacity: 1; }
+
+  .spinner {
+    width: 36px;
+    height: 36px;
+    border: 3px solid #333;
+    border-top-color: #888;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Timing bar */
+  .timings {
+    font-size: 0.75rem;
+    color: #555;
+    font-variant-numeric: tabular-nums;
+    height: 1.2em;
+    text-align: center;
+  }
+
+  .stage-label {
+    font-size: 0.7rem;
+    color: #444;
+    text-align: center;
+    height: 1em;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+</style>
+</head>
+<body>
+
+<h1>Text → Image</h1>
+
+<div class="input-row">
+  <input type="text" id="prompt" placeholder="a fox in a forest at golden hour..." autocomplete="off" />
+</div>
+
+<div class="canvas-wrap">
+  <canvas id="glCanvas"></canvas>
+  <div class="loading-overlay" id="loadingOverlay">
+    <div class="spinner"></div>
+  </div>
+</div>
+
+<div class="stage-label" id="stageLabel"></div>
+<div class="timings" id="timingsLabel"></div>
+
+<script>
+// ─── WebGL setup ─────────────────────────────────────────────────────────────
+
+const canvas = document.getElementById('glCanvas');
+const gl = canvas.getContext('webgl', { alpha: false, antialias: false });
+
+canvas.width = 512;
+canvas.height = 512;
+
+const VERT_SRC = `
+  attribute vec2 a_pos;
+  varying vec2 v_uv;
+  void main() {
+    v_uv = a_pos * 0.5 + 0.5;
+    v_uv.y = 1.0 - v_uv.y;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+  }
+`;
+
+const FRAG_SRC = `
+  precision mediump float;
+  varying vec2 v_uv;
+  uniform sampler2D u_texA;   // current displayed texture
+  uniform sampler2D u_texB;   // next texture (crossfade target)
+  uniform float u_mix;        // 0 = texA, 1 = texB
+  uniform float u_blur;       // CSS blur equivalent via sampling spread
+  void main() {
+    vec4 a = texture2D(u_texA, v_uv);
+    vec4 b = texture2D(u_texB, v_uv);
+    gl_FragColor = mix(a, b, u_mix);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compileShader(gl.VERTEX_SHADER, VERT_SRC));
+gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, FRAG_SRC));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+// Full-screen quad
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1,  1, -1,  -1, 1,
+   1, -1,  1,  1,  -1, 1,
+]), gl.STATIC_DRAW);
+const posLoc = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+const uTexA = gl.getUniformLocation(prog, 'u_texA');
+const uTexB = gl.getUniformLocation(prog, 'u_texB');
+const uMix  = gl.getUniformLocation(prog, 'u_mix');
+
+// Two textures: slot 0 = current, slot 1 = incoming
+const textures = [createTex(), createTex()];
+let currentSlot = 0;   // which texture is currently displayed
+let mixValue = 0;
+let animFrame = null;
+
+function createTex() {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  // blank 1x1 grey pixel
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
+    new Uint8Array([30, 30, 30, 255]));
+  return t;
+}
+
+function uploadImageToTex(slot, img) {
+  gl.bindTexture(gl.TEXTURE_2D, textures[slot]);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+}
+
+function render() {
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, textures[currentSlot]);
+  gl.uniform1i(uTexA, 0);
+
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, textures[1 - currentSlot]);
+  gl.uniform1i(uTexB, 1);
+
+  gl.uniform1f(uMix, mixValue);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+// Animate crossfade from current → next over `durationMs`
+function crossfadeTo(slot, durationMs, onDone) {
+  if (animFrame) cancelAnimationFrame(animFrame);
+  const start = performance.now();
+  const fromSlot = currentSlot;
+
+  function tick(now) {
+    const t = Math.min((now - start) / durationMs, 1);
+    // Smooth ease-in-out
+    const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+
+    // texA = fromSlot, texB = incoming slot
+    // We want mix to go 0→1 as we blend from A to B
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, textures[fromSlot]);
+    gl.uniform1i(uTexA, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, textures[slot]);
+    gl.uniform1i(uTexB, 1);
+    gl.uniform1f(uMix, ease);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    if (t < 1) {
+      animFrame = requestAnimationFrame(tick);
+    } else {
+      currentSlot = slot;
+      mixValue = 0;
+      animFrame = null;
+      if (onDone) onDone();
+    }
+  }
+  animFrame = requestAnimationFrame(tick);
+}
+
+// Initial render (blank)
+render();
+
+// ─── SSE / inference logic ────────────────────────────────────────────────────
+
+const input       = document.getElementById('prompt');
+const overlay     = document.getElementById('loadingOverlay');
+const stageLabel  = document.getElementById('stageLabel');
+const timingsEl   = document.getElementById('timingsLabel');
+
+let debounceTimer = null;
+let activeController = null;
+let isFirstFrame = true;
+
+function showLoading() {
+  overlay.classList.add('visible');
+  stageLabel.textContent = 'thinking…';
+  timingsEl.textContent = '';
+}
+
+function hideLoading() {
+  overlay.classList.remove('visible');
+}
+
+async function loadImageFromB64(b64) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = 'data:image/webp;base64,' + b64;
+  });
+}
+
+async function handleEvent(data) {
+  if (data.type === 'preview') {
+    stageLabel.textContent = 'preview';
+    const img = await loadImageFromB64(data.img);
+    const nextSlot = 1 - currentSlot;
+    uploadImageToTex(nextSlot, img);
+
+    if (isFirstFrame) {
+      // No crossfade for very first image — just show it
+      currentSlot = nextSlot;
+      mixValue = 0;
+      render();
+      isFirstFrame = false;
+    } else {
+      crossfadeTo(nextSlot, 200);
+    }
+
+    hideLoading();
+    const t = data.timings;
+    timingsEl.textContent = `preview: ${t.preview_inference_ms}ms`;
+
+  } else if (data.type === 'final') {
+    stageLabel.textContent = 'final';
+    const img = await loadImageFromB64(data.img);
+    const nextSlot = 1 - currentSlot;
+    uploadImageToTex(nextSlot, img);
+    crossfadeTo(nextSlot, 300, () => {
+      stageLabel.textContent = '';
+    });
+
+    const t = data.timings;
+    timingsEl.textContent =
+      `preview: ${t.preview_inference_ms}ms  ·  final: ${t.final_inference_ms}ms  ·  total: ${t.total_ms}ms`;
+
+  } else if (data.type === 'error') {
+    hideLoading();
+    stageLabel.textContent = 'error: ' + data.message;
+  }
+}
+
+function generate(prompt) {
+  if (!prompt.trim()) return;
+
+  // Cancel any in-flight request
+  if (activeController) {
+    activeController.abort();
+    activeController = null;
+  }
+
+  // Show loading state immediately — 0ms
+  showLoading();
+
+  const controller = new AbortController();
+  activeController = controller;
+
+  const url = `/generate?prompt=${encodeURIComponent(prompt)}`;
+
+  // Use fetch + ReadableStream so we get AbortController support
+  // (EventSource doesn't support abort natively)
+  fetch(url, { signal: controller.signal })
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete last line
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.type === 'done') {
+                activeController = null;
+                return;
+              }
+              await handleEvent(data);
+            } catch (_) {}
+          }
+        }
+      }
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') {
+        hideLoading();
+        stageLabel.textContent = 'connection error';
+        console.error(err);
+      }
+    });
+}
+
+// Debounce typing at 250ms
+input.addEventListener('input', (e) => {
+  clearTimeout(debounceTimer);
+  const val = e.target.value.trim();
+  if (!val) {
+    hideLoading();
+    stageLabel.textContent = '';
+    return;
+  }
+  // Show loading immediately on pause intent
+  debounceTimer = setTimeout(() => generate(val), 250);
+});
+
+// Also allow Enter to trigger immediately
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    clearTimeout(debounceTimer);
+    generate(input.value.trim());
+  }
+});
+
+// Focus input on load
+input.focus();
+</script>
+</body>
+</html>

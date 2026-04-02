@@ -1,0 +1,15 @@
+[project]
+name = "text-to-image-fast"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "diffusers>=0.31",
+    "transformers>=4.45",
+    "accelerate>=1.0",
+    "torch>=2.4",
+    "pillow>=10.4",
+    "sentencepiece>=0.2",
+]
+
