@@ -1,3 +1,5 @@
+Inspired by https://modal.com/solutions/image-and-video 
+
 cd "text-to-image-fast-inference"
 
 **Steps**
